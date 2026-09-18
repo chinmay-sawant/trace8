@@ -9,20 +9,27 @@
 trace8 is a small Go CLI plus a placeholder web frontend. The CLI lives in
 `cmd/trace8` and runs `internal/cli.Run`: `trace8 [--version] [name]`
 prints `hello <name>` (`hello world` by default), `--version` prints
-`trace8 <Version>`, and `--server [--addr :8080]` runs the stdlib HTTP
-server in `internal/server` until interrupted. The frontend in `frontend/`
-is a static placeholder (`src/app.js` writes one line into `#app`); there
-is no frontend build step, and `--server` serves `frontend/` statically.
+`trace8 <Version>`, `trace8 db put|get|del|stats|compact [flags]` reads or
+writes the local keyword store in `internal/store` with `--db` (default
+`trace8.db`) or talks to a running server with `--remote`, and `--server
+[--addr :8080] [--db trace8.db]` runs the stdlib HTTP server in
+`internal/server` until interrupted, serving the `/api/db/*` endpoints
+plus `frontend/` statically. The frontend in `frontend/` is a static
+placeholder (`src/app.js` sets the text of `#app`); there is no
+frontend build step.
 
 Module: `github.com/chinmay-sawant/trace8`.
 Binary: `cmd/trace8` (`internal/cli.Version`, currently `0.0.1` in
 `internal/cli/cli.go`).
 There is a `Makefile` wrapping the gates (`make check` runs vet, tests,
-build), but no `plans/`, no `knowledge-base/`, no `scripts/`,
-and no release or version-stamp tooling. Tests live next to the code
-(`internal/cli/cli_test.go` covers the CLI contract,
-`internal/server/server_test.go` covers the API and static files). Do not reference those paths as if they exist;
-create them only when the task actually needs them.
+build), but no `knowledge-base/`, no `scripts/`, and no release or
+version-stamp tooling. Tests live next to the code
+(`internal/store/*_test.go` covers the log format, replay, truncated
+tails, compaction, and concurrency; `internal/cli/*_test.go` covers the
+CLI contract and every `db` subcommand; `internal/server/server_test.go`
+covers the API, the `/api/db/*` endpoints, and server shutdown). Do not
+reference paths that do not exist as if they do; create them only when
+the task actually needs them.
 
 ## Todo protocol - response-only (mandatory)
 
@@ -55,7 +62,7 @@ inline as a fallback - still do not write a file.
    `git commit`, `git push`, `git restore`, `git clean`, `git reset`, or
    `git stash` unless the user asks. Subagent prompts carry this ban by
    default.
-2. **No em dashes ("—") in any written output, docs, or commit messages.**
+2. **No em dashes in any written output, docs, or commit messages.**
    Use plain hyphens or restructure. This includes this file.
 3. **Commit at session end; never leave a dirty tree.** Uncommitted work is
    the top cause of cross-session rework. If interrupted, record what landed.
@@ -123,11 +130,13 @@ each edit.
 
 ## Things to AVOID (paid-for lessons)
 
-1. **Lint whack-a-mole.** `.golangci.yml` pins the config (enable-all with
-   local excludes, carried over from gowkhtmltopdf); run
-   `golangci-lint run ./...` before opening any PR and fix all linter
-   categories in one pass. `//nolint` is a last resort
-   with a written reason.
+1. **Lint whack-a-mole.** `.golangci.yml` is a curated set
+   (errcheck, govet, ineffassign, staticcheck, unused, misspell, errorlint,
+   bodyclose, unconvert, wastedassign, copyloopvar). The inherited
+   enable-all config produced 1163 style-only findings (wsl, nlreturn,
+   varnamelen, exhaustruct, mnd and similar), so it was replaced rather
+   than chased. Run `golangci-lint run ./...` before opening any PR and
+   keep it green; `//nolint` is a last resort with a written reason.
 2. **Verifying against stale artifacts.** Rebuild before verifying CLI
    behavior: `go run ./cmd/trace8` or `go build -o /tmp/trace8 ./cmd/trace8`.
    Do not assert behavior from a previously built binary.
@@ -148,26 +157,39 @@ each edit.
 9. **Parallel agents on one shared tree.** One agent owns one package
    (e.g. one on `internal/cli`, another on `frontend`, never both on the
    same files).
-10. **Referencing gowkhtmltopdf-era paths.** The `Makefile` only has
-    `build`, `test`, `vet`, `fmt`, `fmt-check`, `run`, `server`, `clean`,
-    `check`, and `help`. There is no `make lint`, `make golden`,
-    `make claim-scan`, `testdata/golden`, `output/`, `documentation/`,
-    `plans/`, or `knowledge-base/` in this repo. Do not
-    cite them as gates or evidence.
+10. **Referencing gowkhtmltopdf-era paths.** The `Makefile` has `build`,
+    `test`, `vet`, `lint` (`Makefile:31-32`), `fmt`, `fmt-check`, `run`,
+    `server`, `clean`, `check`, and `help`. There is no `make golden`,
+    `make claim-scan`, `testdata/golden`, `output/`, `documentation/`, or
+    `knowledge-base/` in this repo. Do not cite them as gates or
+    evidence.
 
 ## trace8 specifics
 
 - **CLI contract** (`internal/cli/cli.go`): flag parsing with
   `flag.ContinueOnError`, usage goes to stderr with exit 2 on bad flags,
   `--version` prints `trace8 <Version>` with exit 0, `--server`
-  (`--addr`, default `:8080`) serves and blocks until interrupt with
-  graceful shutdown, otherwise prints `hello <name>`. Keep all behaviors
-  covered when adding flags; `--version` wins over `--server`.
+  (`--addr`, default `:8080`, `--db`, default `trace8.db`) serves and
+  blocks until interrupt with graceful shutdown, a first positional `db`
+  routes to the subcommands in `internal/cli/db.go`, otherwise prints
+  `hello <name>`. Keywords starting with `body:` are reserved and are
+  rejected by the CLI (`trace8 db put`, exit 1) and by the HTTP API
+  (400). Keep all behaviors covered when adding flags; `--version`
+  wins over `--server` and over `db`.
 - **Tests.** `internal/cli/cli_test.go` covers the CLI contract
   (`--version`, default name, named arg, bad flag exit code);
+  `internal/cli/db_test.go` covers every `db` subcommand (usage exits,
+  put sources, the reserved `body:` prefix, get union, intersection,
+  raw, out, limit, keyword normalization, the `--` terminator, body
+  search, del, stats, compact, bad path); `internal/cli/db_remote_test.go`
+  covers `--remote` against an `httptest` server; `internal/store/*_test.go`
+  covers the log codec, replay, truncated tails, corruption, compaction,
+  permissions, the sticky write error, concurrency, and benchmarks;
   `internal/server/server_test.go` covers `/api/healthz`, `/api/hello`,
-  and static `/` via `httptest` without opening a port. Extend these
-  files before adding matching features.
+  the `/api/db/*` endpoints, the 64 MiB put cap, trailing JSON, keyword
+  validation, the JSON `/api/` 404, server timeouts, and shutdown
+  releasing the store, via `httptest` without opening a port. Extend
+  these files before adding matching features.
 - **Version discipline.** `internal/cli.Version` is a plain constant
   (`0.0.1`); there is no `VERSION` file, no ldflags injection, and no
   version-stamp check. Add that machinery only when cutting a real release.
@@ -184,18 +206,27 @@ each edit.
 The tree is tiny on purpose:
 
 - `cmd/trace8/main.go` - entrypoint, delegates to `cli.Run`.
-- `internal/cli/` - flag parsing and output (`cli.go`, `doc.go`,
-  `cli_test.go`); imports `internal/server` only for `--server` mode.
+- `internal/cli/` - flag parsing and output (`cli.go`, `db.go` for the
+  `db` subcommands and the `--remote` client, `doc.go`, tests); imports
+  `internal/server` only for `--server` mode and `internal/store` for the
+  local db backend.
 - `internal/server/` - stdlib HTTP surface (`doc.go`, `server.go` for
-  lifecycle, `routes.go` for wiring, `handlers.go` for handlers,
-  `server_test.go`).
+  lifecycle and the store handle, `routes.go` for wiring, `handlers.go`
+  for handlers, `server_test.go`).
+- `internal/store/` - append-only local keyword store (`doc.go` package
+  comment, `store.go` for lifecycle, replay, and compaction, `index.go`
+  for types, normalization, tokenizing, and the inverted index,
+  `codec.go` for the `T8LG` log format and per-record gzip, tests next to
+  the code).
 - `frontend/` - static placeholder (`index.html`, `src/app.js`).
 
 File size soft limit: about 2,000 lines per file. No Go file crosses it
 without a written reason recorded in the change. Split module-wise, not
 length-wise: each stage, view, store, or profile gets a focused file, never
 "cut here" chunks. Follow the existing seams (`server.go` owns lifecycle,
-`routes.go` owns wiring, `handlers.go` owns handlers).
+`routes.go` owns wiring, `handlers.go` owns handlers; `store.go` owns
+lifecycle, `index.go` owns the in-memory index, `codec.go` owns the log
+format).
 
 Keep it that way: one package per responsibility, small constructors,
 composition over fat structs. Verify with `go build ./...` + targeted
@@ -203,9 +234,13 @@ tests after any split; do not reorder or rename code during a split.
 
 ## Plans and ledgers
 
-There is no `plans/` directory yet. If a task creates one, keep one
-canonical ledger per effort, close rows on proof only (golden rule 6), and
-use the phase checklist shape from `skills/phase-wise-checklist/`.
+`plans/` exists. `plans/0.0.1/local-keyword-store.md` is the canonical
+ledger for the db effort: the shipped append-log store, the `db` CLI, the
+HTTP API, and the remote client. Keep one canonical ledger per effort,
+close rows on proof only (golden rule 6), and use the phase checklist
+shape from `skills/phase-wise-checklist/`. The ledger's rows stay open
+until verifier evidence is pasted into its `## Verification evidence`
+section; never check them from intent.
 
 ## Skills (this folder)
 

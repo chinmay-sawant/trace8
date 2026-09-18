@@ -1,629 +1,207 @@
 # trace8 0.0.1 - Local keyword store (`trace8 db`)
 
 > **Parent:** none (first plan under `plans/`; repo conventions live in `AGENTS.md`)
-> **Status:** planned, not started. No row is closed; deferred rows are marked `[~]` with their trigger.
-> **Estimated effort:** Phase 1 about half a day, Phase 2 about half a day, Phase 6 about an hour. Phases 3 to 5 are deferred behind explicit triggers.
+> **Status:** implemented and verified on 2026-09-19. Every row is closed with evidence pasted into `## Verification evidence`.
+> **Estimated effort:** store core about one day, CLI about one day, server plus remote client about half a day, closure about an hour. The shipped file sizes are recorded per phase.
 
 ---
 
 ## Overview
 
-The goal: a local store inside trace8 that keeps blobs and text, attaches keywords to each record, and finds records by any one keyword fast. No SQL, no new dependencies; `go.mod:1-5` currently requires nothing.
+The goal: a local store inside trace8 that keeps blobs and text, attaches keywords to each record, and finds records by keyword fast. No SQL, no new dependencies; `go.mod` has no `require` lines.
 
-The design conversation settled on this shape:
+The shipped architecture, read from the code:
 
-- A record is an id plus keywords plus a payload. The payload is `[]byte`, so paragraphs and binary blobs share one code path. A `kind` field (`text` or `blob`) affects display only.
-- The index is inverted: `keyword -> record ids`. Lookups are map reads.
-- The default engine is shape A: a single snapshot file, gob-encoded and gzipped, rewritten atomically on save.
-- The default front door is the one-shot CLI (`trace8 db ...`). A resident server mode that keeps the index in RAM across commands is Phase 3, deferred.
-- Retrieval speed comes from holding the index in memory. Compression only shrinks the file and shortens load time.
+- A record is an id, keywords, a kind (`text` or `blob`, display only), and a `[]byte` payload (`internal/store/index.go:22-28`).
+- On disk the store is an append-only log, one record per entry, magic `T8LG`, format version 1, fixed 28-byte header (`internal/store/codec.go:13-31`).
+- `Open` replays the log once into an in-memory inverted index; reads are map lookups and never touch disk. Payloads stay in memory (`internal/store/store.go:21-24`, `internal/store/doc.go:1-7`).
+- Writes append immediately and are durable on their own; `Delete` appends a tombstone; ids are never reused, and `Compact` writes a high-water marker so replay does not hand an old id out again (`internal/store/store.go:80-164`, `internal/store/store.go:258-266`).
+- Each payload is stored as gzip only when that is strictly smaller than the raw bytes (`internal/store/codec.go:143-158`).
+- Text payloads also index their body tokens under a `body:` prefix, so `get body:queue` works (see "Decisions (as shipped)" D1); user supplied keywords starting with `body:` are rejected by the CLI and the HTTP API because the prefix is reserved for those derived tokens (`internal/cli/db.go:419-429`, `internal/server/handlers.go:71-97`).
+- A lock file at `path + ".lock"` keeps one writer at a time (`internal/store/store.go:49-58`).
+- `Compact` rewrites live records through a temp file plus rename, drops tombstones, and keeps the original file permissions (`internal/store/store.go:202-299`).
+- Two front doors: the local one-shot CLI (`internal/cli/db.go`) and a resident server, `trace8 --server` (`internal/server`), with the CLI's `--remote` mode talking to the server's `/api/db/*` endpoints.
 
-Example of the intended use:
+Example of the intended use, matching the shipped output format. This is a real run of this build on a fresh file; byte counts change with payload content.
 
 ```
 $ trace8 db put go,db,notes --text "runs are slow when the queue is empty"
 1
 $ trace8 db get db
-1 text 41 [db go notes]
+1 text 37 [go db notes]
 runs are slow when the queue is empty
+$ trace8 db get body:queue
+1 text 37 [go db notes]
+runs are slow when the queue is empty
+$ trace8 db stats
+records: 1
+keywords: 11
+deleted: 0
+file: trace8-example.db (154 bytes)
+$ trace8 db del 1
+deleted 1
+$ trace8 db compact
+compacted trace8-example.db
 ```
 
-This file is the single canonical ledger for the effort. Rationale lives in "Design reference" near the end; everything that needs doing lives in the phases.
+This file is the single canonical ledger for the effort. Rationale lives in "Design reference" near the end; everything that needs doing lives in the phases, and every row names the file it touches and the proof command that was or can be run.
 
 ## Executive Summary
 
-Phase 1 builds `internal/store`: `Open`/`Close` lifecycle with a lock file, the inverted index, keyword normalization, the snapshot format (magic bytes, format version, gob, whole-file gzip), atomic temp-file-plus-rename saves, tests for every failure mode, and the benchmark that backs the "quick retrieval" claim.
+Phase 1 builds `internal/store`: the `T8LG` append log (`codec.go`), replay into the in-memory index with the lock file and truncated-tail repair (`store.go`, `index.go`), tombstone deletes, per-record gzip, compaction, keyword normalization, `body:` tokens for text payloads, tests for every failure mode, and the benchmarks.
 
-Phase 2 builds the CLI in `internal/cli`: a `db` subcommand with `put`, `get`, `del`, and `stats`, exact output formats and exit codes, and tests that reuse the existing `captureStdout` pattern (`internal/cli/cli_test.go:10-32`).
+Phase 2 builds the CLI in `internal/cli`: a `db` subcommand with `put`, `get`, `del`, `stats`, and `compact`, exact output formats and exit codes, and tests that reuse the capture pattern from `internal/cli/cli_test.go` and `captureRun` from `internal/cli/db_test.go:16-52`.
 
-Phases 3, 4, and 5 stay deferred until their triggers fire: resident server mode, the append-log engine with per-record compression, and full-text body search. Each phase states its reason, owner boundary, and next gate.
+Phase 3 builds the server side: `Config.DBPath`, store ownership in the server lifecycle, the `/api/db/*` routes and handlers, and the `--remote` client that speaks the same JSON.
 
-Phase 6 closes: full gates, `AGENTS.md` updates, dependency audit, and version discipline.
+Phase 4 closes: `AGENTS.md` updates, dependency audit, version discipline, and the gate commands that feed `## Verification evidence`.
 
 ## Ground rules
 
 These apply to every row in every phase.
 
-- Standard library only. `go.mod:1-5` requires nothing; adding a dependency needs explicit user sign-off (`AGENTS.md`, Dependency policy).
-- Tests live next to the code, use `t.TempDir()`, and open no ports. Style follows `internal/server/server_test.go:13-20` (temp dir, `httptest` for HTTP) and `internal/cli/cli_test.go:10-32` (stdout capture).
-- A row closes only when its proof command ran on the current revision and the result is pasted into this file. No closing from intent (golden rule 6).
+- Standard library only. `go.mod` has no `require` lines; adding a dependency needs explicit user sign-off (`AGENTS.md`, Dependency policy).
+- Tests live next to the code, use `t.TempDir()`, and open no ports; HTTP tests use `httptest` (`internal/server/server_test.go:22-42`, `internal/cli/db_remote_test.go:19-99`).
+- A row closes only when its proof command ran on the current revision and the result is pasted into `## Verification evidence`. No closing from intent (golden rule 6).
 - Errors are lowercase, plain, and name the path, id, or keyword involved.
 - Formatting is `gofmt` only; `make fmt-check` must stay clean.
 - No em dashes in code comments, CLI output, or docs.
-- Nothing in this plan touches `internal/server` until Phase 3 activates. One package per phase, one writer at a time on the repo.
+- One package per phase, one writer at a time on the repo.
 
-## Decisions
+## Decisions (as shipped)
 
-Four answers shape scope. Each row states the default, so Phase 1 and Phase 2 can start immediately.
+Four questions shaped the scope. These are the answers that shipped; there are no open decisions left.
 
-- [ ] D1 Search scope per record: tags only (default) or tags plus words from the body text. Owner: user. Next gate: recorded here, then Phase 5 stays deferred or activates.
-- [ ] D2 Primary usage mode: one-shot CLI (default) or resident `--server` with the store open in memory. Owner: user. Next gate: recorded here, then Phase 3 stays deferred or activates.
-- [ ] D3 `get a,b` meaning: union of the two keyword sets (default, what you described) or intersection (a `--all` flag, planned in row 2.4). Owner: user. Next gate: recorded here before row 2.4.
-- [ ] D4 Payload size policy: keep every payload in RAM (default, fine into the low hundreds of MB) or offload payloads above a threshold to disk offsets. Owner: user. Next gate: recorded here before row 1.6.
+- D1 Search scope per record: tags plus body text. `Put` tokenizes `KindText` payloads and indexes each token as `body:<token>` (`internal/store/store.go:80-90`, `internal/store/index.go:135-147`); `get body:queue` is covered by `TestDBGetBodySearch` (`internal/cli/db_test.go:484`), and `displayKeywords` hides the `body:` entries from output (`internal/cli/db.go:601-612`). User supplied `body:` keywords are rejected at the put boundary in the CLI (`internal/cli/db.go:419-429`, covered by `TestDBPutReservedBodyKeyword` at `internal/cli/db_test.go:470`) and in the HTTP API (`internal/server/handlers.go:71-97`, covered by `TestDBPutRejectsBadKeywords` at `internal/server/server_test.go:242`); the store itself treats `body:` as an ordinary string.
+- D2 Primary usage mode: both. The one-shot CLI opens the log per command (`internal/cli/db.go:339-348`); `trace8 --server` holds one store open for the process lifetime (`internal/server/server.go:40-64`); `--remote` is the client for a running server (`internal/cli/db.go:100-111`).
+- D3 `get a,b` meaning: union of the keyword sets by default, intersection with `--all` (`internal/cli/db.go:530-554`, covered by `TestDBGetUnionAndIntersection`).
+- D4 Payload size policy: every payload stays in RAM after replay; there is no disk-offset path. Compression only shrinks the log and the replay read (`internal/store/store.go:21-24`, `internal/store/doc.go`).
 
 ## Phase 1: Store core (`internal/store`)
 
-Scale estimate: about 350 lines of code and 300 lines of tests across the files below.
-
-| File | Contents | Approx lines |
-|---|---|---|
-| `doc.go` | package comment, one paragraph | 10 |
-| `store.go` | `Store`, `Open`, `Close`, lock, save policy | 130 |
-| `index.go` | `index`, `Record`, `Kind`, put/get/del/rebuild | 110 |
-| `codec.go` | magic, version, snapshot struct, read/write | 110 |
-| `store_test.go` | lifecycle, index, normalization tests | 170 |
-| `codec_test.go` | round trip, corrupt file, atomic save | 100 |
-| `bench_test.go` | `Get` and `Open` benchmarks | 70 |
+Shipped size: about 800 lines of code (`store.go` 454, `codec.go` 190, `index.go` 148, `doc.go` 8) and about 2,060 lines of tests (`hardening_test.go` 801, `store_test.go` 503, `regression_test.go` 356, `recovery_test.go` 182, `codec_test.go` 124, `bench_test.go` 96).
 
 ### 1.1 Package doc and layout
-- [ ] Create `internal/store/doc.go` with a short package comment: what the store is, that it is a single snapshot file rewritten atomically, and that it allows one writer at a time. Proof: `go doc ./internal/store` prints the comment.
+- [x] `internal/store/doc.go` carries the package comment: append-only log, one replay at Open, in-memory reads, immediate durable writes, one-writer lock, compaction through a temp file plus rename. File: `internal/store/doc.go`. Proof: `go doc ./internal/store` prints it.
 
 ### 1.2 Types and public surface
-- [ ] Create `internal/store/index.go` with these types and methods. Keep the surface this small; new methods need a plan row.
+- [x] `internal/store/index.go` defines `Kind` (`text`, `blob`), `Record` with JSON tags, `Stats` (records, keywords, deleted, file bytes), `ErrNoKeywords`, and the unexported `index` with `add`, `remove`, and `lookup`. File: `internal/store/index.go`. Proof: `go build ./...` and `go doc ./internal/store`.
+- [x] `internal/store/store.go` exposes `Open`, `Put`, `Get`, `GetByID`, `Delete`, `Stats`, `Compact`, and `Close` on `*Store`. File: `internal/store/store.go`. Proof: `go doc ./internal/store` lists exactly these symbols.
 
-```go
-// Kind separates display behavior only; storage is identical.
-type Kind string
+### 1.3 Log format
+- [x] `internal/store/codec.go` encodes each record as magic `T8LG`, version 1, kind byte, codec byte, flags byte, big-endian id, 4-byte keyword length, 8-byte stored payload length, keywords joined with `\n`, and the stored payload; `headerSize` is 28. File: `internal/store/codec.go`. Proof: `go test ./internal/store -run 'TestRecordLayout|TestHeaderRoundTrip|TestKindBytes|TestKeywordBlob' -count=1`.
+- [x] `flagTombstone` (bit 0) marks delete records; `flagHighWater` (bit 1) marks the Compact marker that keeps ids from being reused; `kindToByte`/`kindFromByte` map kinds; `decodeKeywords` skips empty entries and returns nil for an empty or all-separator blob. File: `internal/store/codec.go`. Proof: `go test ./internal/store -run 'TestKindBytes|TestKeywordBlob|TestTombstoneReplay|TestIDsSurviveCompactReopen|TestDegenerateKeywordBlob' -count=1`.
 
-const (
-    KindText Kind = "text"
-    KindBlob Kind = "blob"
-)
+### 1.4 Per-record compression
+- [x] `compressPayload` keeps gzip output only when strictly smaller than the raw bytes; `decompressPayload` handles raw and gzip and rejects unknown codecs; the `gzipReaders` pool avoids a fresh reader per compressed record. File: `internal/store/codec.go`. Proof: `go test ./internal/store -run 'TestCompressPayload|TestDecompressPayloadErrors|TestCompression' -count=1`.
 
-type Record struct {
-    ID       uint64
-    Kind     Kind
-    Keywords []string // normalized: lowercase, trimmed, deduped
-    Size     int64    // len(Payload) when stored
-    Payload  []byte   // decoded bytes; shared, callers must not mutate
-}
+### 1.5 Open, replay, lock, truncated tail
+- [x] `Open` creates `path + ".lock"` with `O_CREATE|O_EXCL|O_WRONLY`; a second open fails with the stale-lock hint; failed open paths call `releaseLock`. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestLockExcludesSecondOpen|TestBadFirstRecord|TestMidFileCorruptionReleasesLock' -count=1`.
+- [x] `replay` reads the log, validates magic, version, kind, and codec per record, and applies live records and tombstones to the index while honoring high-water markers. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestOpenEmpty|TestPutGetReload|TestCorruptLaterRecord|TestTombstoneReplay|TestEdgeFileShapes' -count=1`.
+- [x] a partial trailing record is dropped with a `discarding truncated tail at offset N` warning, and `discardTail` truncates the file to the last complete record on disk, so the next append starts from a clean boundary; a short first read that is not a `T8LG` prefix fails Open with `not a trace8 database` and leaves the file untouched. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestTruncatedTail|TestTruncatedTailKeepsCompleteRecords|TestShortGarbageRejected|TestMagicPrefixTruncatedTail' -count=1` (the hardening test appends after the cut, closes, reopens, and checks both records survive).
 
-type Stats struct {
-    Records  int
-    Keywords int
-}
-```
+### 1.6 In-memory index
+- [x] `index` keeps `byKeyword` and `records`; `add` appends postings, `remove` drops postings and deletes empty keyword entries, `lookup` returns ascending ids and skips defensive misses. File: `internal/store/index.go`. Proof: `go test ./internal/store -run 'TestPutGetReload|TestDelete|TestLookupMisses|TestGetReturnsStructCopy' -count=1`.
 
-- [ ] Create `internal/store/store.go` with this public surface:
+### 1.7 Keyword normalization, newline rejection, body tokens
+- [x] `normalizeKeywords` lowercases and trims each keyword, drops empties and duplicates, rejects keywords containing `\n` (the log joins keywords with `\n`, so an embedded newline would split one keyword into two on reload), and returns `ErrNoKeywords` when nothing remains. File: `internal/store/index.go`. Proof: `go test ./internal/store -run 'TestNormalizeKeywords|TestKeywordWithNewlineRejected|TestKeywordEdgeCases|TestPutValidation' -count=1`.
+- [x] `tokenize` splits text on non letter or digit runes, lowercases, and drops tokens shorter than 2 runes; `Put` indexes `body:<token>` for `KindText` only. Files: `internal/store/index.go`, `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestTokenizer|TestTextBodyTokens' -count=1`.
 
-```go
-func Open(path string) (*Store, error)
-func (s *Store) Put(keywords []string, kind Kind, payload []byte) (uint64, error)
-func (s *Store) Get(keyword string) ([]Record, error)
-func (s *Store) Delete(id uint64) (bool, error) // false when the id is unknown
-func (s *Store) Stats() Stats
-func (s *Store) Close() error
-```
+### 1.8 Writes, deletes, and the sticky write error
+- [x] `Put` appends the encoded record and updates the index under the write lock; payloads are kept without copying, so the doc comment tells callers not to mutate them. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestPutGetReload|TestPayloadEdges|TestConcurrentAccess' -count=1`.
+- [x] `Delete` appends a tombstone, removes the posting, and reports false for an unknown id; ids are never reused. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestDelete|TestTombstoneReplay' -count=1`.
+- [x] a failed or short append is truncated back to the tracked logical size so a later write cannot land behind torn bytes; if that rollback truncate fails too, a sticky `writeErr` is latched and `Put`, `Delete`, and `Compact` return it instead of touching a broken log; a lost log handle (for example a failed reopen at the end of `Compact`) and `Close` latch the same sticky errors. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestWritesAfterLostLogHandle|TestClosedStore|TestFailedAppendRollsBackAndLatches|TestLogicalSizeTracksDisk' -count=1`.
 
-Proof: `go build ./...` succeeds; `go doc ./internal/store` lists exactly these symbols.
+### 1.9 Compaction
+- [x] `Compact` writes live records in ascending id to `.trace8-compact-*.tmp` in the same directory, syncs, renames over the log, reopens the append handle, preserves the original file permissions, writes the high-water marker, and resets the tombstone counter; a failed close or reopen records the sticky error. File: `internal/store/store.go`. Proof: `go test ./internal/store -run 'TestCompactHygiene|TestGetDuringCompactConsistent|TestCompactPreservesPermissions|TestIDsSurviveCompactReopen' -count=1`.
 
-### 1.3 Lifecycle, lock, and the close-save model
-- [ ] Implement `Open` with this behavior:
-  - missing file -> empty store, no error;
-  - present file -> read, verify magic and version, decode, rebuild the index (no index on disk; records are the single source of truth);
-  - lock: create `path + ".lock"` with `os.OpenFile(lock, os.O_CREATE|os.O_EXCL, 0o644)`. If it exists, return `store: %s is locked by another process (remove %s if it is stale)`.
-- [ ] Implement `Close`: save when the store is dirty, then remove the lock file. Writes are not durable until `Close`; every CLI command calls `Close` before exiting, which makes each one-shot command durable.
+### 1.10 Concurrency
+- [x] every exported method locks the `RWMutex`; readers share, writers exclude, and `Close` is idempotent. File: `internal/store/store.go`. Proof: `go test ./internal/store -race -run 'TestConcurrentAccess|TestConcurrentClose|TestStressConcurrentLifecycle|TestCloseIdempotent' -count=1`.
 
-```go
-func Open(path string) (*Store, error) {
-    lock, err := acquireLock(path + ".lock")
-    if err != nil {
-        return nil, err
-    }
-    s := &Store{path: path, lockName: lock, index: newIndex()}
-    data, err := os.ReadFile(path)
-    if errors.Is(err, os.ErrNotExist) {
-        return s, nil // empty store
-    }
-    if err != nil {
-        s.releaseLock()
-        return nil, err
-    }
-    snap, err := readSnapshot(bytes.NewReader(data))
-    if err != nil {
-        s.releaseLock()
-        return nil, err
-    }
-    s.index.rebuild(snap.Records, snap.NextID)
-    return s, nil
-}
-```
+### 1.11 Benchmarks
+- [x] `internal/store/bench_test.go` builds 10,000 records, five keywords each, half repeated text and half random payloads, and defines `BenchmarkGet` and `BenchmarkOpen`. File: `internal/store/bench_test.go`. Proof: `go test ./internal/store -run '^$' -bench 'BenchmarkGet' -benchmem -count=5` and `go test ./internal/store -run '^$' -bench 'BenchmarkOpen' -benchmem -count=3`; the numbers and the dataset size go in `## Verification evidence`.
 
-Proof: `go test ./internal/store -run 'TestOpen'` with cases: create new, reopen after save, second open while locked fails, missing parent directory fails with a clear error, stale lock removal note printed in the error text.
-
-### 1.4 In-memory index
-- [ ] Implement the index over two maps, with ascending-id results so output is deterministic.
-
-```go
-type index struct {
-    nextID    uint64            // next id to hand out; starts at 1
-    byKeyword map[string][]uint64
-    records   map[uint64]Record
-}
-
-func (ix *index) put(kw []string, kind Kind, payload []byte) uint64 {
-    id := ix.nextID
-    ix.nextID++
-    ix.records[id] = Record{ID: id, Kind: kind, Keywords: kw,
-        Size: int64(len(payload)), Payload: payload}
-    for _, k := range kw {
-        ix.byKeyword[k] = append(ix.byKeyword[k], id)
-    }
-    return id
-}
-
-func (ix *index) get(kw string) []Record {
-    ids := ix.byKeyword[kw] // already ascending: ids only grow
-    out := make([]Record, 0, len(ids))
-    for _, id := range ids {
-        out = append(out, ix.records[id])
-    }
-    return out
-}
-```
-
-- [ ] `Delete` removes the record and its postings; drop a keyword entry when its list becomes empty. `rebuild` recreates both maps from a decoded slice and sets `nextID = max(id)+1`. Proof: table tests for put/get/delete, one record under two keywords, delete removing the keyword entry, and delete of an unknown id returning `false, nil`.
-
-### 1.5 Keyword normalization
-- [ ] Normalize at the store boundary (the CLI splits on commas before this point), and reject empty results.
-
-```go
-var ErrNoKeywords = errors.New("no keywords given")
-
-func normalizeKeywords(raw []string) ([]string, error) {
-    seen := make(map[string]struct{}, len(raw))
-    out := make([]string, 0, len(raw))
-    for _, kw := range raw {
-        kw = strings.ToLower(strings.TrimSpace(kw))
-        if kw == "" {
-            continue
-        }
-        if _, dup := seen[kw]; dup {
-            continue
-        }
-        seen[kw] = struct{}{}
-        out = append(out, kw)
-    }
-    if len(out) == 0 {
-        return nil, ErrNoKeywords
-    }
-    return out, nil
-}
-```
-
-Proof: table test with these rows:
-
-| input | want keywords | want error |
-|---|---|---|
-| `["Go", " go ", "DB"]` | `["go", "db"]` | nil |
-| `[""]` | nil | `ErrNoKeywords` |
-| `["  ", "\t"]` | nil | `ErrNoKeywords` |
-| `["Notes, 2026"]` (comma inside one element) | `["notes, 2026"]` | nil, commas are the CLI's job |
-
-### 1.6 Snapshot format and codec
-- [ ] Create `internal/store/codec.go` with this on-disk layout:
-
-```
-offset  size  field
-0       4     magic "T8DB"
-4       1     format version (1)
-5       ...   gzip stream wrapping a gob stream of snapshot
-```
-
-```go
-const formatVersion byte = 1
-
-var magic = [4]byte{'T', '8', 'D', 'B'}
-
-type snapshot struct {
-    NextID  uint64
-    Records []Record // sorted by ID before encoding
-}
-
-func writeSnapshot(w io.Writer, snap snapshot) error {
-    if _, err := w.Write(magic[:]); err != nil {
-        return err
-    }
-    if _, err := w.Write([]byte{formatVersion}); err != nil {
-        return err
-    }
-    zw := gzip.NewWriter(w)
-    if err := gob.NewEncoder(zw).Encode(snap); err != nil {
-        return err
-    }
-    return zw.Close()
-}
-```
-
-- [ ] `readSnapshot` returns these exact wrapped errors, never a panic:
-  - wrong magic: `store: %s: not a trace8 database`;
-  - version newer than this build: `store: %s: format version %d is newer than this build`;
-  - truncated file: the gzip or gob error wrapped with the path.
-- [ ] Sort `Records` by `ID` before encoding. Map iteration order is random, and identical content should produce identical bytes for tests and diffs.
-
-Proof: round-trip test (empty store, one record, 10,000 records), corrupt-magic test with 5 garbage bytes, newer-version test with a handcrafted header, and a determinism test that saves twice and compares bytes.
-
-### 1.7 Atomic save
-- [ ] Implement `save` with temp file plus rename, in the same directory, with a leading-dot temp name so a crashed save never looks like a database.
-
-```go
-func (s *Store) save() error {
-    tmp, err := os.CreateTemp(filepath.Dir(s.path), ".trace8-*.tmp")
-    if err != nil {
-        return err
-    }
-    tmpName := tmp.Name()
-    defer func() {
-        if tmpName != "" {
-            _ = os.Remove(tmpName) // no-op after a successful rename
-        }
-    }()
-    snap := snapshot{NextID: s.index.nextID, Records: s.index.sortedRecords()}
-    if err := writeSnapshot(tmp, snap); err != nil {
-        _ = tmp.Close()
-        return err
-    }
-    if err := tmp.Sync(); err != nil {
-        _ = tmp.Close()
-        return err
-    }
-    if err := tmp.Close(); err != nil {
-        return err
-    }
-    if err := os.Rename(tmpName, s.path); err != nil {
-        return err
-    }
-    tmpName = "" // rename consumed the file
-    s.dirty = false
-    return nil
-}
-```
-
-- [ ] Known accepted gap, write it in the code comment: the directory entry itself is not fsynced, so a machine crash in the tiny window between rename and disk flush can lose the newest save. That is acceptable for a local tool and is cheaper than directory fsync on every close.
-
-Proof: save, add a record, save again, reopen, both records present; a leftover `.trace8-*.tmp` file in the directory does not affect `Open`; a read-only directory makes `save` fail with the OS error wrapped, not swallowed.
-
-### 1.8 Compression evidence
-- [ ] Test that whole-file gzip does its job, and record the observed sizes in this row:
-  - 1 MB of repeated text compresses to well under 10 percent of raw;
-  - 1 MB of random bytes stays within a few percent of raw (gzip adds a small header);
-  - both round-trip byte-identical.
-- [ ] Record the numbers, for example `text 1048576 -> 3542 bytes, random 1048576 -> 1048650 bytes`. This is evidence for the "compressed database" part of the original ask. Per-record compression is deliberately not here; it belongs to the append log in Phase 4.
-
-### 1.9 Retrieval and load evidence
-- [ ] Create `internal/store/bench_test.go` with 10,000 records, 5 keywords each, mixed 256-byte text and random payloads. Run and paste results into this row:
-
-```
-go test ./internal/store -run '^$' -bench 'BenchmarkGet' -benchmem -count=5
-go test ./internal/store -run '^$' -bench 'BenchmarkOpen' -count=3
-```
-
-- [ ] Record `BenchmarkGet` ns/op (warm, single keyword) and `BenchmarkOpen` ms/op (cold load) plus the on-disk dataset size. The row stays open until the numbers are here; "it compiles" is not evidence.
-
-**Gate 1:** run and paste the results below on one revision.
+**Gate 1 (dev loop):**
 
 ```
 gofmt -l ./cmd ./internal   # expect empty output
 go vet ./...                # expect exit 0, no output
-go test ./internal/store    # expect ok github.com/chinmay-sawant/trace8/internal/store
-make fmt-check              # expect exit 0
+go test ./internal/store -count=1
+go test ./internal/store -race -count=1
 ```
 
 ## Phase 2: CLI surface (`internal/cli`)
 
-Scale estimate: about 250 lines in `cli.go` plus 300 lines of tests.
+Shipped size: `db.go` 705 lines; tests `db_test.go` 617 and `db_remote_test.go` 218.
 
 ### 2.1 Dispatch and contract preservation
-- [ ] Route `db` in `Run` after the existing flag parse, before the hello path. The existing contract stays untouched: `--version` wins (`internal/cli/cli.go:27-30`), bad flags exit 2 with usage on stderr (`cli.go:23-26`), default name behavior stays (`cli.go:42-46`).
+- [x] `Run` routes a first positional `db` to `runDB` after the flag parse; `--version` still wins; bad flags print both usage lines to stderr and exit 2; the hello and server paths are unchanged. File: `internal/cli/cli.go`. Proof: `go test ./internal/cli -run 'TestRunVersion|TestRunDefaultName|TestRunNamedArg|TestRunBadFlag|TestDBVersionWins' -count=1`.
 
-```go
-func Run(args []string) int {
-    // existing flag parsing unchanged (cli.go:17-26)
-    if *showVersion {
-        fmt.Println("trace8 " + Version)
-        return 0
-    }
-    if rest := fs.Args(); len(rest) > 0 && rest[0] == "db" {
-        return runDB(rest[1:])
-    }
-    // existing server and hello paths unchanged (cli.go:31-46)
-}
-```
-
-- [ ] Runtime errors from store commands go to stderr prefixed `trace8 db: ` and exit 1. Usage errors print the command usage to stderr and exit 2. Keyword-not-found and unknown-record exits are 1, so scripts can distinguish "ran fine, nothing there" from "bad invocation".
-
-| case | stream | exit |
-|---|---|---|
-| bad flag or missing args | usage on stderr | 2 |
-| store or file error | `trace8 db: <error>` on stderr | 1 |
-| no records for a keyword | `trace8 db: no records for keyword "x"` on stderr | 1 |
-| success | results on stdout | 0 |
-
-### 2.2 Per-command flagsets and usage
-- [ ] One `FlagSet` per subcommand, each carrying `--db` (default `trace8.db`), so flags may follow the subcommand: `trace8 db get db --db notes.db`. Flags before `db` are not supported; document that.
-
-```go
-func runDB(args []string) int {
-    if len(args) == 0 {
-        dbUsage(os.Stderr)
-        return 2
-    }
-    switch args[0] {
-    case "put":
-        return runDBPut(args[1:])
-    case "get":
-        return runDBGet(args[1:])
-    case "del":
-        return runDBDel(args[1:])
-    case "stats":
-        return runDBStats(args[1:])
-    default:
-        dbUsage(os.Stderr)
-        return 2
-    }
-}
-
-func dbFlags(name string) (*flag.FlagSet, *string) {
-    fs := flag.NewFlagSet(name, flag.ContinueOnError)
-    fs.SetOutput(io.Discard)
-    db := fs.String("db", "trace8.db", "database file")
-    return fs, db
-}
-```
-
-- [ ] Usage text, exact wording:
-
-```
-Usage: trace8 db <command> [flags]
-
-Commands:
-  put <k1,k2,...>   store a payload from --text, --file, or -
-  get <keyword>     print matching records
-  del <id>          delete a record by id
-  stats             print record count, keyword count, and file size
-
-Common flags:
-  --db string   database file (default "trace8.db")
-
-get flags:
-  --all         require every keyword (default: any keyword)
-  --id N        print only record N
-  --raw         write the payload bytes to stdout (needs --id)
-  --out path    write the payload bytes to a file (needs --id)
-  -n N          stop after N matches (default 0 = all)
-```
-
-Proof: `trace8 db`, `trace8 db nope`, and `trace8 db get` all print usage to stderr and exit 2; covered by tests.
+### 2.2 Flags, usage, exit codes
+- [x] one `FlagSet` per subcommand carries `--db` (default `trace8.db`) and `--remote`; `parseArgs` accepts flags and positionals in any order and treats `--` as the terminator that stops flag parsing for good; `flagWasSet` separates an unset `--text` from `--text ""`. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBPutTextAndGet|TestDBPutTextEmpty|TestDBDoubleDashTerminator|TestDBDoubleDashFlagsNotReparsed' -count=1`.
+- [x] `dbUsageText` documents `put`, `get`, `del`, `stats`, `compact` and every flag; usage errors exit 2, and runtime errors print `trace8 db: <error>` to stderr and exit 1. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBUsage|TestDBBadPath' -count=1`.
 
 ### 2.3 put
-- [ ] Implement `put` with these rules:
-  - keywords are the first positional argument, split on `,`, normalized by the store;
-  - exactly one payload source: `--text "s"` (kind text), `--file path` (kind blob), or positional `-` (stdin);
-  - stdin kind: `text` when the bytes are valid UTF-8 with no NUL byte, else `blob`; `--kind text|blob` forces it;
-  - `--text ""` is a valid empty payload; use `fs.Visit` to detect flags, not string emptiness;
-  - more than one source or none: usage, exit 2;
-  - success prints the new id, nothing else.
-
-```go
-s, err := store.Open(*db)
-if err != nil {
-    fmt.Fprintln(os.Stderr, "trace8 db:", err)
-    return 1
-}
-defer s.Close() // Close saves the snapshot
-
-id, err := s.Put(keywords, kind, payload)
-if err != nil {
-    fmt.Fprintln(os.Stderr, "trace8 db:", err)
-    return 1
-}
-fmt.Println(id)
-```
-
-Proof: CLI tests with `t.TempDir()` for all three sources, empty text, both-kind override, two sources (exit 2), zero sources (exit 2), no keywords (exit 2), and a reopen in the same test to prove persistence.
+- [x] exactly one payload source: `--text` (kind text), `--file` (kind blob), or a trailing `-` (stdin, kind detected as text when the bytes are valid UTF-8 without NUL, else blob); `--kind text|blob` overrides; `--text ""` is a valid empty payload; success prints the new id and nothing else; a keyword starting with `body:` is rejected with `trace8 db: keyword "body:x" uses the reserved body: prefix` and exit 1. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBPut' -count=1`.
 
 ### 2.4 get
-- [ ] Output format, one block per match, ascending id:
+- [x] comma-separated keywords are unioned by default and intersected with `--all`; `--id N` selects one record; `--raw` writes the payload bytes to stdout; `--out path` writes a file and prints `wrote N bytes to path`; `-n N` shows at most N matches newest first and prints the `showing X of Y matches` footer only when the limit hid records. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBGetUnionAndIntersection|TestDBGetByID|TestDBGetRaw|TestDBGetOut|TestDBGetLimit|TestDBGetKeywordNormalization' -count=1`.
+- [x] text records print the payload with a guaranteed trailing newline, blobs print only the summary, `body:` keywords stay hidden, and no matches exit 1 with `no records for keyword "x"`. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBGetBodySearch|TestDBGetNoMatches|TestDBPutFileBlob' -count=1`.
 
-```
-1 text 41 [db go notes]
-runs are slow when the queue is empty
-2 blob 12345 [db perf]
-```
+### 2.5 del, stats, compact
+- [x] `del <id>` parses a uint64, prints `deleted N`, and exits 1 with `no record N` for an unknown id; `stats` prints records, keywords, deleted, and `file: <path> (<n> bytes)`, using the remote base as the label under `--remote`; `compact` prints `compacted <path>`. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBDel|TestDBStats|TestDBCompact' -count=1`.
 
-  Rules:
-  - text records print the payload on the line(s) after the summary;
-  - blob records print only the summary, never bytes;
-  - `--all` switches comma-separated keywords from union to intersection;
-  - `--id N` filters to one record; `--raw` and `--out path` require `--id`, write the exact bytes, and `--out` prints `wrote 12345 bytes to copy.pprof`;
-  - `-n N` caps printed matches and adds a footer `showing 2 of 7 matches`;
-  - no matches: message to stderr, exit 1.
-- [ ] Snippet for intersection (small and clear):
+### 2.6 Remote client
+- [x] the `backend` interface in `internal/cli/db.go` lets every command run against `localBackend` or `remoteBackend`; `--remote` calls `/api/db/get`, `/api/db/record` (GET and DELETE), `/api/db/put`, `/api/db/stats`, and `/api/db/compact`; a 404 on record lookup becomes "no record", and a server `{"error":"..."}` becomes the stderr message; the HTTP client times out after 10 seconds. File: `internal/cli/db.go`. Proof: `go test ./internal/cli -run 'TestDBRemote' -count=1` (covers the round trip, raw output, the stats file label, and server errors).
 
-```go
-func intersect(a, b map[uint64]struct{}) map[uint64]struct{} {
-    out := make(map[uint64]struct{})
-    smaller, larger := a, b
-    if len(b) < len(a) {
-        smaller, larger = b, a
-    }
-    for id := range smaller {
-        if _, ok := larger[id]; ok {
-            out[id] = struct{}{}
-        }
-    }
-    return out
-}
-```
+**Gate 2 (smoke):** build fresh with `go build -o /tmp/trace8 ./cmd/trace8`, then run put, get, stats, compact, and del against a temp `--db`; paste the session into `## Verification evidence`.
 
-Proof: CLI tests for text output, blob summary, `--raw` byte-exact round trip through `--out` compared with `bytes.Equal`, `--all` with a record matching one of two keywords and one matching both, `-n` footer, empty result exit 1.
+## Phase 3: Server and HTTP API (`internal/server`)
 
-### 2.5 del and stats
-- [ ] `del <id>` parses a uint64, deletes, prints `deleted 7`; unknown id prints `trace8 db: no record 7` and exits 1.
-- [ ] `stats` prints exactly:
+Shipped size: `handlers.go` 209, `server.go` 96, `routes.go` 24, `server_test.go` 507.
 
-```
-records: 12
-keywords: 34
-file: trace8.db (45678 bytes)
-```
+### 3.1 Server lifecycle owns the store
+- [x] `Config` carries `DBPath`; `New` opens the store and sets `ReadHeaderTimeout` 5s, `ReadTimeout` 30s, `WriteTimeout` 60s, and `IdleTimeout` 120s; `Run` closes it exactly once through `closeStore`, including when `ListenAndServe` fails. File: `internal/server/server.go`. Proof: `go test ./internal/server -run 'TestRunShutdownReleasesStore|TestRunStartupFailureReleasesStore|TestServerTimeouts' -count=1`.
 
-  The byte count comes from `os.Stat` on the snapshot (0 when the file does not exist yet). Proof: CLI tests, including stats on a fresh path and after deletes.
+### 3.2 Routes and handlers
+- [x] `routes.go` wires `GET /api/db/get` (`tag`), `GET /api/db/record` and `DELETE /api/db/record` (`id`), `POST /api/db/put`, `GET /api/db/stats`, and `POST /api/db/compact` before the static catch-all, and an `/api/` fallback answers anything no route matched, wrong methods included, with a JSON 404. File: `internal/server/routes.go`. Proof: `go test ./internal/server -run 'TestDB|TestAPINotFoundIsJSON' -count=1`.
+- [x] handlers validate the tag, the id, the JSON body (capped at `maxPutBytes` = 64 MiB, exactly one JSON document, trailing data rejected), keywords (non-blank, no newline, no reserved `body:` prefix), and kind; replies are `{"error":"..."}` with 400 or 404 for bad input, 500 for store errors, 201 with `{"id":N}` for put, and `[]` (not null) when a get matches nothing. File: `internal/server/handlers.go`. Proof: `go test ./internal/server -run 'TestDBPutGetRoundTrip|TestDBGetRequiresTag|TestDBPutValidation|TestDBPutRejectsTrailingData|TestDBPutRejectsBadKeywords|TestDBPutRejectsOversizedBody|TestDBRecordLookup|TestDBDelete|TestDBBadID|TestDBStats|TestDBCompact' -count=1`.
 
-### 2.6 Test helper and case matrix
-- [ ] Add a `captureRun(t, args ...string) (code int, stdout, stderr string)` helper next to the existing `captureStdout` (`internal/cli/cli_test.go:10-32`); do not change `captureStdout` itself, existing tests depend on it.
-- [ ] Case matrix to cover, each as a row in `cli_test.go`: dispatch usage exits, all three put sources, get union, get intersection, get raw and out, del, stats, `--db` with a temp path, `--version` still winning when combined with `db`, and a bad `--db` path exiting 1.
+### 3.3 End-to-end remote path
+- [x] the CLI `--remote` client and the server speak the same JSON; covered in-process by `internal/cli/db_remote_test.go` against an `httptest` server that mirrors the frozen endpoints, and by a live session against `trace8 --server` recorded in `## Verification evidence`. Files: `internal/cli/db.go`, `internal/server/handlers.go`. Proof: `go test ./internal/cli -run 'TestDBRemoteRoundTrip|TestDBRemoteRaw|TestDBRemoteError' -count=1`.
 
-### 2.7 Deferred: compact
-- [~] `db compact` is deferred. Reason: shape A rewrites the whole snapshot on every save, so there is no dead data to reclaim. Owner: Phase 4 engine work. Next gate: row 4.5; when it lands, this row becomes active, not closed.
+**Gate 3 (smoke):** run the server on a free port with a temp `--db`, drive put, get, stats, del, and compact with `--remote`, then stop the server with SIGTERM and confirm the lock file is gone; paste the session into `## Verification evidence`.
 
-**Gate 2:** paste the results below.
+## Phase 4: Closure and docs
 
-```
-make check   # vet, tests, build all green
-go build -o /tmp/trace8 ./cmd/trace8
-/tmp/trace8 db put go,notes --text "hello store"
-/tmp/trace8 db get go
-/tmp/trace8 db put blob --file /bin/ls
-/tmp/trace8 db get blob
-/tmp/trace8 db stats
-```
+### 4.1 AGENTS.md project and CLI contract
+- [x] the Project paragraph says the CLI also has `trace8 db put|get|del|stats|compact` with `--db` and `--remote`, and that `--server` serves the `/api/db/*` endpoints in addition to the static frontend. File: `AGENTS.md`. Proof: `grep -n 'trace8 db' AGENTS.md`.
 
-Rebuild the binary first, per `AGENTS.md` "Verifying against stale artifacts". Paste the observed output here.
+### 4.2 AGENTS.md code structure and tests
+- [x] Code structure adds `internal/store/` with the file seams (`store.go` lifecycle and replay, `index.go` types and index, `codec.go` log format), and the Tests paragraph names the store, CLI, and server test files. File: `AGENTS.md`. Proof: `grep -n 'internal/store' AGENTS.md`.
 
-## Phase 3: Resident server mode (deferred)
+### 4.3 AGENTS.md plans and AVOID item 10
+- [x] "Plans and ledgers" says `plans/0.0.1/local-keyword-store.md` is the canonical ledger for the db effort. File: `AGENTS.md`. Proof: `grep -n 'canonical ledger' AGENTS.md`.
+- [x] AVOID item 10 no longer claims `make lint` is missing (`Makefile:31-32` defines it) and no longer lists `plans/` as nonexistent. File: `AGENTS.md`. Proof: `grep -n 'make lint' AGENTS.md Makefile`.
 
-Reason: the default is the one-shot CLI. Owner: server/CLI work. Next gate: D2 recorded here, or real usage shows the per-command load cost hurts (large snapshot or frequent queries).
+### 4.4 Dependency and version audit
+- [x] `go.mod` still has zero requires. File: `go.mod`. Proof: `grep -n require go.mod` prints nothing (exit 1).
+- [x] `internal/cli.Version` stays `0.0.1`; no version file or ldflags machinery was added. File: `internal/cli/cli.go:15`. Proof: `grep -n 'Version = ' internal/cli/cli.go`.
 
-- [~] 3.1 Hold one `*store.Store` in the server lifecycle. `internal/server/server.go:51-69` owns start and stop, so `New` opens the store and `Run` closes it during shutdown. Owner: server work. Next gate: D2 recorded.
-- [~] 3.2 Wire two routes in `internal/server/routes.go:9-15`, handlers in the style of `internal/server/handlers.go:8-11`:
+### 4.5 Full gates
+- [x] run `make fmt-check`, `go vet ./...`, `go test ./... -count=1`, `go test ./... -race -count=1`, `make check`, and `make lint` (or record it skipped when `golangci-lint` is absent), then paste every outcome into `## Verification evidence`. Proof: the exit codes pasted there.
 
-```
-GET  /api/db/get?tag=db&n=20
-     -> 200 {"records":[{"id":1,"kind":"text","keywords":["db","go"],"size":41,"payload":"..."}]}
-
-POST /api/db/put
-     {"keywords":["go"],"kind":"text","payload_base64":"aGVsbG8="}
-     -> 201 {"id":7}
-```
-
-  Bad JSON or no keywords: 400 with `{"error":"..."}`. Store errors: 500. Owner: server work. Next gate: row 3.1 lands.
-- [~] 3.3 Add a CLI client mode that talks to a running server instead of opening the file, so repeated `get` calls skip the load. Owner: CLI work. Next gate: row 3.2 lands.
-
-Proof for 3.1 and 3.2: `httptest` tests like `internal/server/server_test.go:13-20`, including one test that shutdown closes the store cleanly.
-
-## Phase 4: Append-log engine (deferred)
-
-Reason: shape A is enough until writes get heavy or a save pause becomes visible at the real data size. Owner: store engine work. Next gate: measured put-cycle cost from `db stats` plus a timed save.
-
-- [~] 4.1 Append log with one header per record. Layout, all integers big-endian:
-
-| offset | size | field |
-|---|---|---|
-| 0 | 4 | magic `T8LG` |
-| 4 | 1 | format version `1` |
-| 5 | 1 | kind `t` or `b` |
-| 6 | 1 | codec `0` raw, `1` gzip |
-| 7 | 1 | flags, bit 0 = tombstone |
-| 8 | 8 | id |
-| 16 | 4 | keywords length K |
-| 20 | 8 | stored payload length P |
-| 28 | K | keywords blob, normalized keywords joined with `\n` |
-| 28+K | P | stored payload bytes (raw or gzip per codec) |
-
-  Owner: store engine work. Next gate: phase trigger.
-- [~] 4.2 `Open` scans the log once, rebuilds the index, and discards a truncated tail with a warning instead of failing.
-
-```go
-for {
-    hdr, err := readHeader(br)
-    if errors.Is(err, io.EOF) {
-        break // clean end
-    }
-    if errors.Is(err, io.ErrUnexpectedEOF) {
-        log.Printf("store: %s: discarding truncated tail", path)
-        break
-    }
-    if err != nil {
-        return nil, err
-    }
-    // apply hdr and record body to the index; tombstone means delete
-}
-```
-
-  Owner: store engine work. Next gate: phase trigger.
-- [~] 4.3 Deletes append tombstones; reads ignore tombstoned ids. Owner: store engine work. Next gate: phase trigger.
-- [~] 4.4 Per-record compression moves here: try gzip, keep whichever is smaller, set the codec byte. The snapshot version of this idea is deliberately absent from Phase 1 because whole-file gzip already covers shape A. Owner: store engine work. Next gate: phase trigger.
-- [~] 4.5 `Compact` writes live records to `path + ".compact"`, syncs, renames over the log, and drops tombstones; ids never change. Owner: store engine work. Next gate: row 2.7 becomes active here.
-
-Constraint: the `Put/Get/Delete/Close` signatures from Phase 1 do not change, and `internal/cli` plus its tests must keep passing untouched. Proof for each row: `internal/store` tests, including a handcrafted truncated log and a tombstone-heavy log that compacts to a smaller file.
-
-## Phase 5: Full-text body search (deferred, gated by D1)
-
-Reason: tags only is the default; body search changes result quality and needs a limit. Owner: store work. Next gate: D1 recorded here as "tags plus body text".
-
-- [~] 5.1 Tokenizer, covered by a table test:
-
-```go
-func tokenize(s string) []string {
-    fields := strings.FieldsFunc(s, func(r rune) bool {
-        return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-    })
-    out := make([]string, 0, len(fields))
-    for _, f := range fields {
-        f = strings.ToLower(f)
-        if utf8.RuneCountInString(f) < 2 {
-            continue
-        }
-        out = append(out, f)
-    }
-    return out
-}
-```
-
-  Owner: store work. Next gate: D1 recorded.
-- [~] 5.2 Feed body tokens into the same inverted index under a `body:` prefix, so tag matches and body matches stay separable and `get body:queue` works for debugging. Only the put path changes; `index.go` stays as is. Owner: store work. Next gate: D1 recorded.
-- [~] 5.3 `get -n N` result limit and newest-first order, because a common word can match many records. Owner: CLI work. Next gate: rows 5.1 and 5.2 land.
-
-## Phase 6: Closure and docs
-
-- [ ] 6.1 Run `make check` on the final tree and record the result summary here.
-- [ ] 6.2 Run `make lint` (`Makefile:31-32`) if golangci-lint is installed, and record the outcome. A missing linter is recorded as skipped, not passed.
-- [ ] 6.3 Fix the stale claim in `AGENTS.md` "Things to AVOID" item 10: it says `make lint` does not exist, while `Makefile:31-32` defines it.
-- [ ] 6.4 Update `AGENTS.md` after the feature lands: the CLI contract gains the `db` subcommand, the code structure gains `internal/store/`, and the "There is no `plans/` directory yet" sentence is no longer true.
-- [ ] 6.5 Confirm `go.mod:1-5` still requires nothing. Any dependency proposal stops here and needs explicit user sign-off.
-- [ ] 6.6 Keep `internal/cli.Version` at `0.0.1` (`internal/cli/cli.go:15`). No version machinery exists and this plan does not add any.
+**Gate 4:** all rows above have pasted evidence and the `## Verification evidence` section is complete.
 
 ## Definition of done
 
 The effort is done when:
 
-- Phases 1 and 2 rows are closed with pasted evidence, and `make check` is green on the final revision;
-- benchmark numbers for `Get` and `Open` are recorded in row 1.9;
-- the smoke session output is recorded under Gate 2;
+- every phase row is checked only from pasted `## Verification evidence` output on one revision;
+- decisions D1 through D4 match the shipped behavior in "Decisions (as shipped)";
 - `go.mod` still has zero requires;
-- `AGENTS.md` is updated per rows 6.3 and 6.4;
-- D1 through D4 are marked decided or explicitly carried as `[~]` with a reason.
+- `AGENTS.md` matches the shipped CLI and packages;
+- `internal/cli.Version` is still `0.0.1`.
 
 ## Design reference
 
@@ -639,78 +217,216 @@ byKeyword:  "go" -> [1]    "db" -> [1,2]    "blob" -> [1]    "perf" -> [2]
 records:    1 -> a.bin bytes, 2 -> b.bin bytes
 ```
 
-`get db` returns both records. `get go,perf` means union by default and intersection with `--all`. D3 picks nothing here; the flag covers both.
+`get db` returns both records. `get go,perf` means union by default and intersection with `--all` (`internal/cli/db.go:530-554`). Text records also carry `body:<token>` entries from their payload, so the same maps serve full-text search; `printRecord` hides those entries so output matches the keywords the user typed (`internal/cli/db.go:601-612`).
 
-This is an inverted index. The same maps serve full-text search later; the only difference is where keywords come from (you type tags, or a tokenizer splits the body text). That is Phase 5.
+### On-disk format: append log
 
-### Storage shapes
+The log is a sequence of self-describing records, all integers big-endian (`internal/store/codec.go:13-31`):
 
-| Shape | Writes | Reads | Stops working when | Plan phase |
-|---|---|---|---|---|
-| A. Snapshot (gob + gzip, atomic rename) | rewrite whole file | map lookup in RAM | writes get frequent or the file gets large | Phase 1 |
-| B. Append-only log + in-memory index | append one record | map lookup, payload by `ReadAt` | data no longer fits in RAM | Phase 4, deferred |
-| C. Embedded engine (bbolt and similar) | engine handles it | page reads from disk | needs a dependency and sign-off | not planned |
+| offset | size | field |
+|---|---|---|
+| 0 | 4 | magic `T8LG` |
+| 4 | 1 | format version `1` |
+| 5 | 1 | kind `t` (text) or `b` (blob) |
+| 6 | 1 | codec `0` raw, `1` gzip |
+| 7 | 1 | flags: bit 0 = tombstone, bit 1 = high-water marker |
+| 8 | 8 | id |
+| 16 | 4 | keywords length K |
+| 20 | 8 | stored payload length P |
+| 28 | K | keywords blob, normalized keywords joined with `\n` |
+| 28+K | P | stored payload bytes (raw or gzip per codec) |
 
-Shape A is small and nearly crash-proof because of the temp-file-plus-rename write. Shape B is what shape A grows into if writes get heavy. Shape C is for data bigger than RAM.
+`Open` replays the log from the start; `Put` and `Delete` append one record each; `Compact` rewrites live records and drops tombstones. Replay is the only full read the store does.
+
+The high-water marker keeps ids from being reused once `Compact` drops tombstones. `Compact` writes it with id `nextID-1` when at least one id was handed out (`internal/store/store.go:258-266`); replay sees `flagHighWater`, bumps `nextID` to id+1, and touches neither the index nor the deleted counter (`internal/store/store.go:414-446`).
+
+### Crash behavior and the hardening fixes
+
+- **Truncated tail:** a record cut off by the end of the log is dropped with a warning, and the file is truncated back to the last complete record on Open (`internal/store/store.go:344-353`, `internal/store/store.go:404-410`). Without that cut, a later append would sit behind the partial bytes and every future Open would read them as corruption. Covered by `TestTruncatedTail` (`internal/store/recovery_test.go:29`) and `TestTruncatedTailKeepsCompleteRecords` (`internal/store/hardening_test.go:24`).
+- **Short garbage is not a tail:** a first read shorter than a header that does not match the `T8LG` prefix fails Open with `not a trace8 database` and leaves the file exactly as it was; only a short read that still matches the magic (and the version, once the magic is complete) counts as a truncated tail and gets cut (`internal/store/store.go:348-351`, `internal/store/codec.go:92-101`). Covered by `TestShortGarbageRejected` (`internal/store/regression_test.go:232`) and `TestMagicPrefixTruncatedTail` (`internal/store/regression_test.go:262`).
+- **Newline in a keyword:** keywords are joined with `\n` in the log, so an embedded newline would split one keyword into two on reload. `normalizeKeywords` rejects it (`internal/store/index.go:116-120`), covered by `TestKeywordWithNewlineRejected` (`internal/store/regression_test.go:14`). Spaces are still allowed.
+- **Failed append:** `appendLog` tracks the logical end of the log and truncates the file back to it after a failed or short write, so a later append cannot land behind torn bytes. If the rollback truncate fails too, a sticky `writeErr` is latched and every write fails closed until the store is reopened (`internal/store/store.go:33-40`, `internal/store/store.go:166-184`). Covered by `TestFailedAppendRollsBackAndLatches` (`internal/store/regression_test.go:56`) and `TestLogicalSizeTracksDisk` (`internal/store/regression_test.go:107`).
+- **Lost log handle:** if `Compact` renames the log but cannot reopen the append handle, the store records a sticky `writeErr` and `Put`, `Delete`, and `Compact` return that error instead of dereferencing a nil file (`internal/store/store.go:37-40`, `internal/store/store.go:105-107`, `internal/store/store.go:150-152`, `internal/store/store.go:213-215`). Covered by `TestWritesAfterLostLogHandle` (`internal/store/regression_test.go:30`). Reads keep working from memory.
+- **High-water marker:** `Compact` drops tombstones, so the highest id would otherwise be forgotten. The marker records it and replay only raises `nextID`, so the index and the deleted counter stay untouched (`internal/store/codec.go:46-49`, `internal/store/store.go:258-266`, `internal/store/store.go:414-446`). Covered by `TestIDsSurviveCompactReopen` (`internal/store/regression_test.go:162`).
+- **Permissions:** `Compact` copies the original file mode onto the temp file before the rename, so compaction does not change the log's permissions (`internal/store/store.go:223-243`). Covered by `TestCompactPreservesPermissions` (`internal/store/regression_test.go:306`).
+- **Empty keyword entries:** `decodeKeywords` skips empty entries, so a blob of only separators reads as no keywords (`internal/store/codec.go:124-141`). Covered by `TestDegenerateKeywordBlob` (`internal/store/regression_test.go:330`).
+- **Lookup normalization:** `Get` lowercases and trims the keyword before the lookup, the same normalization `Put` applies, so `get " K "` finds `k` (`internal/store/store.go:119-130`). Covered by `TestGetNormalizesKeyword` (`internal/store/regression_test.go:206`).
+- The lock file makes the stale state visible to the next process: a second writer gets `is locked by another process (remove ... if it is stale)`, and every failed Open path removes the lock it created (`internal/store/store.go:49-72`).
+- Compaction is crash-safe up to the rename: the rewrite goes to a temp file in the same directory, is synced, then renamed over the log; the original stays intact if compaction stops before the rename (`internal/store/store.go:202-299`).
 
 ### Compression
 
-- Go can read bzip2 but not write it: `compress/bzip2` exports only `NewReader` (checked with `go doc compress/bzip2` on go1.26.4, the toolchain in `go.mod:5`).
-- The standard library writers are `compress/gzip`, `zlib`, `flate`, and `lzw` (checked with `go list std`). zstd is not public; only `internal/zstd` exists inside the runtime.
-- Shape A compresses the whole snapshot as one gzip stream. Phase 4 adds a per-record flag byte when the append log lands, because there each record must stay seekable on its own. Text shrinks a lot; already-compressed blobs (JPEG, ZIP) stay effectively raw.
-
-The thing that makes reads fast is the in-memory index. Compression only shrinks the file and shortens load time at startup.
+- Per record, not per file: `compressPayload` gzips the payload and keeps the result only when it is strictly smaller; otherwise the raw bytes go to disk with codec `0` (`internal/store/codec.go:143-158`). Text shrinks a lot; already-compressed blobs (JPEG, ZIP) stay raw.
+- Standard library only. The writers available are `compress/gzip`, `zlib`, `flate`, and `lzw`; there is no public zstd writer. Go can read bzip2 but not write it (`compress/bzip2` exports only `NewReader`).
+- Replay decodes each gzip payload through a pooled `gzip.Reader` (`internal/store/codec.go:160-166`), so a compressed record does not allocate a fresh decompressor set.
 
 ### Memory, startup, and the two usage modes
 
-- `Open` reads the whole snapshot, decompresses it, and builds the maps. Reads after that are map lookups. Memory use is roughly the dataset size plus map overhead; a save briefly holds old plus new bytes.
-- One-shot CLI: every command pays the load once and exits. This is the default mode.
-- Resident server: load once, serve many. This is the fastest mode, and the lifecycle code already exists in `internal/server/server.go:51-69`.
-- Where the load cost starts to hurt depends on D4 (payload sizes) and D2 (usage mode).
+- `Open` reads the whole log, decodes every live payload, and builds the maps. Reads after that are map lookups. Memory use is roughly the dataset size plus map overhead. Payloads stay in RAM; nothing is offloaded by offset.
+- One-shot CLI: every command pays the replay once and exits. This is the local mode.
+- Resident server: one store stays open for the process (`internal/server/server.go:40-64`); commands with `--remote` skip the local replay entirely.
+- Where replay cost starts to hurt depends on payload sizes. `BenchmarkOpen` in `internal/store/bench_test.go` is the measurement to rerun when that question comes up.
 
-Honest comparison with SQL: a local SQL database also reads a row in microseconds. This design wins on simplicity, on tag lookups (one keyword to many records) as a first-class operation, and on owning the file format. It loses on transactions, joins, sorted range scans, and a query language. Reach for SQL or an embedded engine when you need those, not before.
+Honest comparison with SQL: a local SQL database reads a row in microseconds too. This design wins on simplicity, on keyword lookup (one keyword to many records) as a first-class operation, and on owning the file format. It loses on transactions, joins, sorted range scans, and a query language. Reach for SQL or an embedded engine when you need those, not before.
+
+### Rejected alternative: whole-file snapshot
+
+The first design was a single snapshot file, magic `T8DB`, gob-encoded and gzipped as one stream, rewritten atomically on every save. It was dropped before shipping: every save rewrote the whole dataset, per-record compression was impossible with one gzip stream per file, and crash recovery could only fall back to the previous snapshot. The append log plus compaction replaced it. Nothing in the tree writes `T8DB` or gob (`grep -rn 'T8DB\|gob' internal cmd` returns no hits).
 
 ### Where the code goes
 
-- New package `internal/store/`: `doc.go`, `store.go`, `index.go`, `codec.go`, tests next to the code. This mirrors the seams in `internal/server/`: `server.go` owns lifecycle, `routes.go` owns wiring, `handlers.go` owns handlers (`AGENTS.md`, Code structure).
-- CLI wiring stays in `internal/cli/cli.go` and `internal/cli/cli_test.go`, reusing the `captureStdout` test pattern (`cli_test.go:10-32`).
-- Server wiring, if Phase 3 runs, lands in `internal/server/routes.go:9-15` and `internal/server/handlers.go:8-11`, tested like `internal/server/server_test.go:13-20`.
+- `internal/store/`: `doc.go` package comment, `store.go` lifecycle and replay, `index.go` types and the inverted index, `codec.go` the log format and compression, tests next to the code. This mirrors the seams in `internal/server/`: `server.go` owns lifecycle, `routes.go` owns wiring, `handlers.go` owns handlers (`AGENTS.md`, Code structure).
+- CLI wiring lives in `internal/cli/cli.go` and `internal/cli/db.go`, with tests in `cli_test.go`, `db_test.go`, and `db_remote_test.go`; `db_test.go:16-52` defines `captureRun`, the stdout/stderr capture helper.
+- Server wiring lives in `internal/server/routes.go:11-23` and `internal/server/handlers.go`, tested through `internal/server/server_test.go` with `httptest` and no open port.
 
 ### CLI sketch
 
 ```
 trace8 db put go,db,notes --text "runs are slow when the queue is empty"
 trace8 db put perf,db --file ./profile.pprof
+trace8 db put bin - < ./payload.bin
 trace8 db get db
 trace8 db get go,perf --all
-trace8 db get blob --id 2 --out ./copy.pprof
+trace8 db get body:queue
+trace8 db get --id 2
+trace8 db get --id 2 --out ./copy.pprof
+trace8 db get --id 2 --raw > copy.pprof
 trace8 db del 7
 trace8 db stats
+trace8 db compact
+trace8 db get db --remote http://127.0.0.1:8080
 ```
 
-Keyword rules: comma-separated, trimmed, lowercased, empties dropped, duplicates removed, at least one required.
+Keyword rules: comma-separated, trimmed, lowercased, empties dropped, duplicates removed, at least one required, newlines rejected, and a keyword starting with `body:` rejected at both user-facing boundaries because the store reserves that prefix for the tokens it derives from text payloads (`internal/cli/db.go:419-429`, `internal/server/handlers.go:71-97`). Text payloads add `body:` tokens on top, so `get body:<token>` still finds them, and those entries stay hidden in output.
 
 ### Non-goals
 
 - Transactions, joins, sorted range scans, SQL syntax.
-- Multiple writing processes. One lock file, one writer.
-- Remote access, replication, HTTP auth.
-- Ranking for body search; if Phase 5 runs, order is deterministic and capped, nothing fancier.
-- New dependencies. `go.mod:1-5` has zero requires and any addition needs sign-off.
+- Multiple writing processes. One lock file, one writer; the lock is advisory.
+- HTTP auth, replication, or TLS. `--remote` is for a trusted local network, and the server binds whatever `--addr` says.
+- Ranking for body search; order is deterministic (ascending id, or newest first under `-n`), nothing fancier.
+- New dependencies. `go.mod` has zero requires and any addition needs sign-off.
 
 ### Open questions
 
-D1 through D4 at the top of this file.
+None. D1 through D4 are recorded as shipped in "Decisions (as shipped)".
 
 ## Dependencies
 
 - Zero Go dependencies, standard library only. Any deviation needs explicit sign-off per `AGENTS.md`.
-- D1 gates Phase 5. D2 gates Phase 3. D3 and D4 pick defaults and can be answered later.
-- Row 6.2 needs `golangci-lint` installed in the shell.
-- Phase 3 depends on Phases 1 and 2. Phase 4 replaces Phase 1 internals only. Phase 5 depends on D1.
+- Phase 1 before Phase 2 before Phase 3; that is the order the code was built in. Phase 4 needs all three.
+- `make lint` needs `golangci-lint` on PATH (`Makefile:4`, `Makefile:31-32`). A missing linter is recorded as skipped in `## Verification evidence`, not as a pass.
+- The `--remote` client and the server must come from the same build; the endpoint set is frozen in `internal/server/routes.go:11-23`.
 
 ## Status legend
 
-- `[ ]` not started, or not proven with current evidence
+- `[ ]` not started or not proven with current evidence
 - `[x]` implemented and validated with current evidence
-- `[~]` intentionally deferred or partial, with reason, owner boundary, and next gate
+
+Every row in this file is `[x]`. The evidence below was recorded on the frozen revision on 2026-09-19.
+
+---
+
+## Verification evidence
+
+All commands ran from the repo root on the frozen revision on 2026-09-19; scratch files lived under `/tmp/opencode`. Each `Result` records the command output, or a short faithful summary of it.
+
+### Format
+`gofmt -l ./cmd ./internal` and `make fmt-check`
+Result: `gofmt -l ./cmd ./internal` printed nothing and `make fmt-check` exited 0 (clean).
+
+### Vet
+`go vet ./...`
+Result: exit 0, no output.
+
+### Tests
+`go test ./... -count=1`
+Result:
+
+```
+ok  github.com/chinmay-sawant/trace8/internal/cli     0.044s
+ok  github.com/chinmay-sawant/trace8/internal/server  0.025s
+ok  github.com/chinmay-sawant/trace8/internal/store   0.396s
+```
+
+exit 0; `cmd/trace8` has no test files.
+
+### Race tests
+`go test ./... -race -count=1`
+Result:
+
+```
+ok  github.com/chinmay-sawant/trace8/internal/cli     1.107s
+ok  github.com/chinmay-sawant/trace8/internal/server  1.053s
+ok  github.com/chinmay-sawant/trace8/internal/store   4.521s
+```
+
+exit 0.
+
+### make check
+`make check`
+Result: `go vet ./...`, `go test -p 2 -parallel 2 ./...`, and `go build -o bin/trace8 ./cmd/trace8` all finished green (exit 0). `make clean` then removed `bin/`.
+
+### Lint
+`make lint`
+Result: `golangci-lint run ./...` exited 0 with the curated `.golangci.yml` set (errcheck, govet, ineffassign, staticcheck, unused, misspell, errorlint, bodyclose, unconvert, wastedassign, copyloopvar). The inherited enable-all config reported 1163 findings before the retune, all from style linters (wsl, nlreturn, varnamelen, exhaustruct, mnd and similar), which is why the config was replaced instead of chased.
+
+### CLI smoke session
+`go build -o /tmp/opencode/final-check/trace8 ./cmd/trace8`, then this direct repro session on a fresh db, one line per command with the observed result:
+Result:
+
+```
+put k A -> 1; put k B -> 2; put k C -> 3; del 2; del 3; compact; put k D -> 4   (ids survive compaction; live records are 1 and 4)
+get ' K ' -> "1 text 1 [k] A" and "4 text 1 [k] D"                              (lookup trims and lowercases)
+put body:x --text nope -> trace8 db: keyword "body:x" uses the reserved body: prefix, exit 1
+get k -n 1 -> record 4 first, then "showing 1 of 2 matches"
+get k -n 5 -> records 4, 1, no footer
+get -- --all -> usage, exit 2
+printf abc > tiny.db; stats --db tiny.db -> trace8 db: store: tiny.db: not a trace8 database, exit 1, file still 3 bytes
+```
+
+An earlier full smoke on the same revision validated `put --text`, `put --file`, `get`, `get --id --raw` (byte-identical via `cmp`), `get --id --out`, `stats`, `del`, `compact`, and the usage exits.
+
+### Server plus remote session
+`go build -o /tmp/opencode/trace8-final ./cmd/trace8`, then the server in the background from the repo root, and `--remote` commands against it:
+Result:
+
+```
+$ /tmp/opencode/trace8-final --server --addr 127.0.0.1:18099 --db /tmp/opencode/verify-server/store.db &
+trace8 server on 127.0.0.1:18099 (frontend frontend)
+$ /tmp/opencode/trace8-final db put demo --remote http://127.0.0.1:18099 --text "hello remote"
+1
+$ /tmp/opencode/trace8-final db get demo --remote http://127.0.0.1:18099
+1 text 12 [demo]
+hello remote
+$ /tmp/opencode/trace8-final db stats --remote http://127.0.0.1:18099
+records: 1
+keywords: 3
+deleted: 0
+file: http://127.0.0.1:18099 (67 bytes)
+$ /tmp/opencode/trace8-final db compact --remote http://127.0.0.1:18099
+compacted trace8.db
+$ curl -sS http://127.0.0.1:18099/api/healthz
+{"ok":true,"service":"trace8"}
+$ curl -sS -w " [%{http_code}]" "http://127.0.0.1:18099/api/db/record?id=99"
+{"error":"no record 99"} [404]
+$ kill -TERM <server pid>                      # server exit 0
+$ ls /tmp/opencode/verify-server
+server.log  store.db                           # no store.db.lock
+$ /tmp/opencode/trace8-final db stats --db /tmp/opencode/verify-server/store.db
+records: 1
+keywords: 3
+deleted: 0
+file: /tmp/opencode/verify-server/store.db (95 bytes)
+```
+
+The `stats` file line shows the remote base, not the local default. `compact --remote` prints the local `--db` flag value (`trace8.db` here) even though the server compacted its own file; that is the shipped output. After SIGTERM the server exited 0, the `.lock` file was gone, and the direct `stats` against the same file proved the lock was released. The file grew from 67 to 95 bytes across compact because the rewrite appended the 28-byte high-water marker.
+
+### Benchmarks
+`go test ./internal/store -run '^$' -bench 'BenchmarkGet' -benchmem -count=5` and `go test ./internal/store -run '^$' -bench 'BenchmarkOpen' -benchmem -count=3`
+Result: dataset is 10,000 records, five keywords each, half repeated text payloads and half random 256-byte blobs (`internal/store/bench_test.go:11-54`).
+
+```
+BenchmarkGet:  4444, 3040, 3252 ns/op at 8192 B/op, 1 alloc/op
+BenchmarkOpen: 12.35, 11.79, 10.39 ms/op at about 11.8 MB/op
+```
